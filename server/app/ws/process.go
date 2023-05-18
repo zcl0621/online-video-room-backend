@@ -4,231 +4,155 @@ import (
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
-	"github.com/pion/webrtc/v3"
 	"log"
 	"net/http"
-	"online-video-room-backend/database"
-	"online-video-room-backend/model"
 	"os"
-	"os/signal"
 	"sync"
+	"time"
 )
 
-func init() {
-	go closePeerConnections()
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }
 
-var peerConnections = make(map[string]*webrtc.PeerConnection)
-var perrLock = &sync.Mutex{}
+type client struct {
+	Conn *websocket.Conn
+	Id   int64
+}
+
+var fileMap = make(map[string]*os.File)
+var fileMapLock = &sync.Mutex{}
+
+var wsMap = make(map[string][]*client)
+var wsMapLock = &sync.Mutex{}
+
+func makeVideoFile(key string) (*os.File, error) {
+	videoFile, err := os.Create(fmt.Sprintf("/tmp/tmp_%s.txt", key))
+	if err != nil {
+		log.Println("Failed to create video file:", err)
+		return nil, err
+	}
+	return videoFile, nil
+}
 
 func rtcHolder(c *gin.Context) {
-	var request wsRequest
-	if e := c.ShouldBindQuery(&request); e != nil {
-		c.JSON(400, gin.H{"error": "参数错误"})
-		return
-	}
-	conn, err := (&websocket.Upgrader{
-		ReadBufferSize:  10240,
-		WriteBufferSize: 10240,
-		// 允许所有CORS跨域请求
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
-	}).Upgrade(c.Writer, c.Request, nil)
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		c.JSON(400, gin.H{"error": "连接异常"})
+		log.Println("Failed to upgrade websocket:", err)
 		return
 	}
-	db := database.GetInstance()
-	var roomModel model.Room
-	if e := db.First(&roomModel, request.RoomId).Error; e != nil {
-		sendMsg(conn, []byte("房间不存在"))
+
+	log.Println("New WebSocket connection")
+
+	var request wsRequest
+	if err := c.ShouldBindQuery(&request); err != nil {
+		log.Println("Failed to read WebSocket message:", err)
 		return
 	}
-	if roomModel.GuestName != request.Name || roomModel.MasterName != request.Name {
-		sendMsg(conn, []byte("不是房间用户"))
+
+	userKey := fmt.Sprintf("%d_%s", request.RoomId, request.Name)
+	roomKey := fmt.Sprintf("%d", request.RoomId)
+	fileLock := fileMapLock.TryLock()
+	if !fileLock {
+		sendError(conn, "文件锁失败")
 		return
 	}
-	ok := perrLock.TryLock()
-	if !ok {
-		sendMsg(conn, []byte("连接数已满"))
-		return
-	}
-	key := fmt.Sprintf("%d_%s", request.RoomId, request.Name)
-	pc, ok := peerConnections[key]
-	if !ok {
-		peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	file, ok := fileMap[userKey]
+	if !ok || file == nil {
+		nfile, err := makeVideoFile(userKey)
 		if err != nil {
-			sendMsg(conn, []byte("创建webrtc失败"))
+			sendError(conn, "创建文件失败")
 			return
 		}
-		peerConnections[key] = peerConnection
-		pc = peerConnection
+		file = nfile
+		fileMap[userKey] = file
 	}
-	perrLock.Unlock()
-	if pc == nil {
-		sendMsg(conn, []byte("创建webrtc失败"))
+	fileMapLock.Unlock()
+	wsc := &client{
+		Id:   time.Now().UnixNano(),
+		Conn: conn,
+	}
+	wsLock := wsMapLock.TryLock()
+	if !wsLock {
+		sendError(conn, "WebSocket锁失败")
 		return
 	}
-	// Set up ICE handling
-	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
-		if candidate != nil {
-			// Send ICE candidate to remote peer through WebSocket
-			if err := conn.WriteJSON(candidate.ToJSON()); err != nil {
-				log.Println("Failed to send ICE candidate:", err)
-			}
+	wsList, ok := wsMap[roomKey]
+	if !ok || wsList == nil {
+		wsList = []*client{
+			wsc,
 		}
-	})
-
-	// Set up SDP handling
-	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		log.Println("New remote track:", track.ID())
-
-		// Create a file to record the video
-		file, err := os.Create(fmt.Sprintf("%s.webm", key))
-		if err != nil {
-			log.Println("Failed to create video file:", err)
-			return
-		}
-
-		// Write the received video packets to the file
-		rtpRecorder := &RTPRecorder{
-			Track: track,
-			File:  file,
-		}
-		rtpRecorder.Start()
-	})
-
-	// Handle SDP offer/answer
-	handleSDP := func(sessionDescription webrtc.SessionDescription) {
-		if err := pc.SetRemoteDescription(sessionDescription); err != nil {
-			log.Println("Failed to set remote description:", err)
-			return
-		}
-
-		if sessionDescription.Type == webrtc.SDPTypeOffer {
-			// Create an answer
-			answer, err := pc.CreateAnswer(nil)
-			if err != nil {
-				log.Println("Failed to create answer:", err)
-				return
-			}
-
-			// Set local description and send it to remote peer
-			if err := pc.SetLocalDescription(answer); err != nil {
-				log.Println("Failed to set local description:", err)
-				return
-			}
-
-			// Send SDP answer to remote peer through WebSocket
-			if err := conn.WriteJSON(answer); err != nil {
-				log.Println("Failed to send SDP answer:", err)
-			}
-		}
+		wsMap[roomKey] = wsList
+	} else {
+		wsList = append(wsList, wsc)
+		wsMap[roomKey] = wsList
 	}
-
+	wsMapLock.Unlock()
+	closeCH := make(chan struct{}, 100)
+	conn.SetCloseHandler(func(code int, text string) error {
+		closeCH <- struct{}{}
+		return nil
+	})
 	// Read messages from WebSocket
 	for {
-		var msg map[string]interface{}
-		if err := conn.ReadJSON(&msg); err != nil {
-			log.Println("Failed to read WebSocket message:", err)
-			break
-		}
-
-		switch msg["type"] {
-		case "offer":
-			offer := webrtc.SessionDescription{
-				Type: webrtc.SDPTypeOffer,
-				SDP:  msg["sdp"].(string),
-			}
-			handleSDP(offer)
-
-		case "answer":
-			answer := webrtc.SessionDescription{
-				Type: webrtc.SDPTypeAnswer,
-				SDP:  msg["sdp"].(string),
-			}
-			handleSDP(answer)
-
-		case "candidate":
-			sdpMid := msg["sdpMid"].(string)
-			sdpMLineIndex := msg["sdpMLineIndex"].(uint16)
-			candidate := webrtc.ICECandidateInit{
-				Candidate:     msg["candidate"].(string),
-				SDPMid:        &sdpMid,
-				SDPMLineIndex: &sdpMLineIndex,
-			}
-			// Add ICE candidate
-			if err := pc.AddICECandidate(candidate); err != nil {
-				log.Println("Failed to add ICE candidate:", err)
-			}
-		case "close":
-			err := pc.Close()
-			if err != nil {
-				log.Println("close peer connection", err.Error())
-			}
-			ok := perrLock.TryLock()
-			if !ok {
-				sendMsg(conn, []byte("连接数已满"))
+		select {
+		case <-closeCH:
+			log.Println("WebSocket connection closed")
+			wsLock := wsMapLock.TryLock()
+			if !wsLock {
+				sendError(conn, "WebSocket锁失败")
 				return
 			}
-			pc = nil
-			peerConnections[key] = nil
-			perrLock.Unlock()
-			conn.Close()
-		}
-	}
-}
-
-func closePeerConnections() {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-	<-c
-	perrLock.TryLock()
-	for _, pc := range peerConnections {
-		if pc != nil {
-			func() {
-				defer func() {
-					if err := recover(); err != nil {
-						return
+			wsList, ok := wsMap[roomKey]
+			if ok && wsList != nil {
+				for i, c := range wsList {
+					if c.Id == wsc.Id {
+						wsList = append(wsList[:i], wsList[i+1:]...)
+						wsMap[roomKey] = wsList
+						break
 					}
-				}()
-				e := pc.Close()
-				log.Println("close peer connection", e.Error())
-			}()
-
+				}
+			}
+			wsMapLock.Unlock()
+			return
+		default:
+			msgType, data, err := conn.ReadMessage()
+			if err == nil {
+				switch msgType {
+				case websocket.TextMessage:
+					if string(data) == "end" {
+						file.Close()
+						go func() {
+							convert(fmt.Sprintf("/tmp/tmp_%s.txt", userKey), userKey)
+						}()
+						return
+					} else {
+						file.Write([]byte("\n"))
+						file.Write(data)
+						broadcastVideoData(data, roomKey, wsc.Id)
+					}
+				}
+			}
 		}
 	}
 }
 
-func sendMsg(conn *websocket.Conn, msg []byte) {
-	e := conn.ReadJSON(msg)
-	if e != nil {
-		log.Println("send msg error", e.Error())
-	}
+func sendError(conn *websocket.Conn, err string) {
+	conn.WriteJSON(&errorResponse{
+		Err: err,
+	})
 }
 
-type RTPRecorder struct {
-	Track *webrtc.TrackRemote
-	File  *os.File
-}
-
-func (r *RTPRecorder) Start() {
-	go func() {
-		for {
-			packet, _, err := r.Track.ReadRTP()
+func broadcastVideoData(data []byte, roomKey string, ownerId int64) {
+	for _, client := range wsMap[roomKey] {
+		if client != nil && client.Conn != nil && client.Id != ownerId {
+			err := client.Conn.WriteMessage(websocket.TextMessage, data)
 			if err != nil {
-				log.Println("Failed to read RTP packet:", err)
-				break
-			}
-
-			// Write the packet to the video file
-			if _, err := r.File.Write(packet.Payload); err != nil {
-				log.Println("Failed to write video packet:", err)
-				break
+				log.Println("Error broadcasting video data:", err)
+				client.Conn.Close()
 			}
 		}
-
-		r.File.Close()
-	}()
+	}
 }
